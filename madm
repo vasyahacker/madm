@@ -1,0 +1,940 @@
+#!/bin/sh
+# Mail ADMin script for OpenBSD (OpenSMTPD/dovecot/rspamd/quotas/sqlite users db)
+# TODO:
+# 1 [X] migrate new db
+# 2 quotes 
+#   [X]  select
+#   [X]  edit
+# 3 aliases
+#   [X]  delete
+#   [X]  add
+#   [ ]  edit
+# 4 add domain
+#   [X]  db
+#   [X]  dkim
+#   [X]  DMARC+rsmapd-config
+#   [X]  new admin user+aliases
+# 5 help
+#   [X]  show dns records by selected domain
+#   [X]  system setup
+#   [ ]  autoconfig for clients
+
+[ "$(uname)" == "OpenBSD" ] || { echo "Sorry. This script only for OpenBSD.."; exit 1; }
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+UDB=/etc/mail/mail_db.sqlite
+
+CRE='\033[0;31m';CGR='\033[0;32m';CBGR='\033[1;32m'
+CYE='\033[0;33m';CUPUR='\033[4;35m';CICYA='\033[0;96m'
+CBIWH='\033[1;97m';CIBL='\033[0;94m';NC='\033[0m'
+
+PS_PROTECT='/./././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././././.'
+
+SQ3="${PS_PROTECT}$(whereis sqlite3)"
+DADM="${PS_PROTECT}$(whereis doveadm)"
+P="${PS_PROTECT}$(whereis printf)"
+SHA512="${PS_PROTECT}$(whereis sha512)"
+
+read_char(){ stty -icanon -echo; eval "$1=\$(dd bs=1 count=1 2>/dev/null)"; stty icanon echo; }
+read_pass(){ _prompt="$1"; stty -echo; printf "$_prompt "; read $2; stty echo; printf "\n"; }
+query(){ $SQ3 $UDB 'PRAGMA foreign_keys = ON;' "$1" "$2" "$3" "$4" && return 0 || return 1; }
+
+Yn(){
+  _prompt="$1"
+  printf "%s [Y/n]: " "$_prompt"
+  while IFS= read_char _ans
+  do
+    [ "$_ans" == "n" -o "$_ans" == "N" ] && { printf "${CRE}N${NC}\n"; return 1; }
+    [ "$_ans" == "" -o "$_ans" == "y" -o "$_ans" = "Y" ] && { printf "${CBGR}Y${NC}\n"; return 0; }
+  done
+}
+
+yN(){
+  _prompt="$1"
+  printf "%s [y/N]: " "$_prompt"
+  while IFS= read_char _ans
+  do
+    [ "$_ans" == "" -o "$_ans" == "n" -o "$_ans" == "N" ] && { printf "${CBGR}N${NC}\n"; return 1; }
+    [ "$_ans" == "y" -o "$_ans" = "Y" ] && { printf "${CRE}Y${NC}\n"; return 0; }
+  done
+}
+
+if_not_num(){
+  _num=$1
+  _from=$2
+  _to=$3
+  [ -z "$_num" ] && return 0
+  [ -z "${_num##*[!0-9]*}" -o $_num -lt $_from -o $_num -gt $_to ] && return 0
+  return 1
+}
+
+set_password() {
+  Yn "Generate strong password?" && {
+    _password="$(tr -cd '[:alnum:]\.\[\]!@#$*\-_' < /dev/urandom | fold -w14 | head -n 1)"
+    echo "New password: $_password"
+    true
+  }||{
+    while true
+    do
+      read_pass "Enter password:" _password
+      read_pass "Check password:" _password_check
+      [ "$_password" != "$_password_check" ] && { echo "Mismatch!"; continue; } || break
+    done
+  }
+  echo "PLEASE DO NOT FORGET NEW PASSWORD!"
+  eval "$1='$_password'"
+}
+
+init_db() {
+  [ -e $UDB ] && mv -v $UDB ${UDB}.backup
+  $SQ3 $UDB << _EOF
+PRAGMA foreign_keys = ON;
+CREATE TABLE domains (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  domain VARCHAR(255) NOT NULL,
+  UNIQUE(domain)
+);
+
+CREATE TABLE credentials (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  domain_id INTEGER NOT NULL,
+  email VARCHAR(255) NOT NULL,
+  quota INTEGER NOT NULL,
+  password VARCHAR(255) NOT NULL,
+  UNIQUE(email),
+  FOREIGN KEY (domain_id) REFERENCES domains (id) 
+    ON DELETE CASCADE ON UPDATE NO ACTION
+);
+
+CREATE TABLE virtuals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  email VARCHAR(255) NOT NULL,
+  destination TEXT NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES credentials (id) 
+    ON DELETE CASCADE ON UPDATE NO ACTION
+);
+_EOF
+}
+
+select_domain() {
+  _ids=$(query "SELECT MAX(id) FROM domains;")
+  [ -z "$_ids" ] && _ids=0
+  _domains="$(query ".mode column" "SELECT id, domain FROM domains;")"
+  while true
+  do
+    printf "\nSelect domain:\n%s\nEnter domain id [0-%d] (0 to main menu): " "$_domains" $_ids
+    read _did
+    if_not_num "$_did" 0 $_ids && continue
+    [ $_did -eq 0 ] && break
+    _domain="$(query "SELECT domain FROM domains WHERE id=$_did;")"
+    [ -z "$_domain" ] && continue
+    break
+  done
+  eval "$1='$_domain';$2=$_did;"
+}
+
+select_user() {
+  select_domain _domain _domain_id
+  [ $_domain_id -eq 0 ] && { eval "$2=0"; return; }
+  _ids=$(query "SELECT MAX(id) FROM credentials WHERE domain_id=$_domain_id;")
+  [ -z "$_ids" ] && _ids=0
+  _users="$(query ".mode column" "SELECT id, email, (quota/1024/1024)||' MB' AS quota FROM credentials WHERE domain_id=$_domain_id;")"
+  while true
+  do
+    printf "\nSelect user:\n%s\nEnter user id [0-%d] (0 to main menu): " "$_users" $_ids
+    read _uid
+    if_not_num "$_uid" 0 $_ids && continue
+    [ $_uid -eq 0 ] && break
+    _addr="$(query "SELECT email FROM credentials WHERE id=$_uid AND domain_id=$_domain_id;")"
+    [ -z "$_addr" ] && continue
+    break
+  done
+  eval "$1='$_addr';$2=$_uid;"
+}
+
+#regen_rspamd_dkim_conf() {
+#  _conf_file="/etc/rspamd/local.d/dkim_signing.conf"
+#  [ -e $_conf_file ] || touch $_conf_file
+#  (tr '\n' '\f' | sed -e 's/domain[\s]*[^\}]*.*}//' | tr '\f' '\n' | sed '/^[[:blank:]]*$/ d' > ${_conf_file}.new) < $_conf_file
+#  cat >> ${_conf_file}.new << _EOF
+#domain {
+#$(query "SELECT domain FROM domains;" | while IFS= read _domain;do echo "\t$_domain {\n\t\tpatch = \"/etc/mail/dkim/${_domain}.key\";\n\t\tselector = \"default\";\n\t}";done)
+#}
+#_EOF
+#  mv -f ${_conf_file}.new $_conf_file
+#  rcctl reload rspamd
+#}
+
+delete_domain() {
+  select_domain domain domain_id
+  [ $domain_id -eq 0 ] && return
+  yN "Delete $domain and all mailboxes?" || return
+  echo -n "Type $domain to confirm: "
+  read _confirm_domain
+  [ "$domain" != "$_confirm_domain" ] && return
+  echo "Removing domain.."
+  query "DELETE FROM domains WHERE id=$domain_id"
+  [ -d "/var/vmail/$domain" ] && rm -rfv /var/vmail/$domain
+  echo "Removing DKIM keys.."
+  rm -f /var/rspamd/dkim/${domain}.dkim.key
+  rm -f /var/rspamd/dkim/${domain}.pub
+#  regen_rspamd_dkim_conf
+  echo "Domain $domain domain and all its mailboxes have been deleted"
+}
+
+set_quota_mb() {
+  while true
+  do
+    echo -n "Enter user quota in megabytes: "
+    read _mb
+    if_not_num "$_mb" 1 100000000 && continue
+    break
+  done
+  eval "$1=$_mb"
+}
+
+new_user() {
+  [ -n "${1}" -a -n "${2}" ] && {
+    domain="$1"
+    domain_id=$2
+  } || select_domain domain domain_id
+  [ $domain_id -eq 0 ] && return
+  while true
+  do
+    echo -n "\nEnter new user name at $domain without domain\n(or press enter for return to main menu): "
+    read name
+    [ -z "$name" ] && return 1
+    echo -n "$name" | grep -q '^[a-zA-Z0-9\-\.]\{1,\}$' || continue
+    email="${name}@${domain}"
+    existence="$(query "SELECT email FROM credentials WHERE email='$email';")"
+    [ -n "$existence" ] && { echo "\nUser $email already exist!"; continue; }
+#    domain="$(printf "$email" | sed -n 's/^.*@\(.*\)$/\1/p')"
+#    existence="$(query "SELECT domain FROM domains WHERE domain='$domain';")"
+#    [ -z "$existence" ] && { Yn "Domain $domain does not exist in database, continue?" || continue; }
+    set_password password
+    blf="$(echo -n "$password" | smtpctl encrypt)"
+    set_quota_mb quota_mb
+    uid="$(query "INSERT INTO
+      credentials(domain_id, email, quota, password)
+      VALUES ($domain_id, '$email', ${quota_mb}*1024*1024, '$blf');
+      SELECT MAX(id) FROM credentials;")"
+    [ -z "$uid" ] && { printf "\nERROR!\n"; continue; }
+    query "INSERT INTO virtuals(user_id, email, destination) VALUES ($uid, '$email', 'vmail');" || continue
+    sha="$($SHA512 -qs "$password")"
+    $DADM -o plugin/mail_crypt_private_password="$sha" mailbox cryptokey generate -u $email -U
+    echo "\nNew user $email added"
+    break
+  done
+}
+
+change_quota() {
+  echo "Select domain/user for quota change:"
+  select_user _addr _uid
+  [ $_uid -eq 0 ] && return
+  set_quota_mb quota_mb
+  query "UPDATE credentials SET quota=${quota_mb}*1024*1024 WHERE id=$_uid;" || { echo "\nERROR\n"; continue; }
+  printf "\nQuota for user %s set to %d mb\n" "$_addr" $quota_mb
+}
+
+change_password() {
+  echo "\nWhich domain/user to change password:"
+  select_user _addr _uid
+  [ "$_uid" == "0" ] && return
+  while true
+  do
+    read_pass "Enter old password for user $_addr:" _old_pass
+    _old_blf="$(query "SELECT password from credentials WHERE id=$_uid;")"
+    $DADM pw -t "{crypt}$_old_blf" -p "$_old_pass" >/dev/null 2>&1 && {
+      echo "The old password is correct!"
+    } || {
+      echo "The old password is incorrect!"
+      continue
+    }
+    _old_sha="$(echo -n "$_old_pass" | $SHA512 -q)"
+    set_password _new_pass
+    _new_sha="$(echo -n "$_new_pass" | $SHA512 -q)"
+    $DADM mailbox cryptokey password -u $_addr -n "$_new_sha" -o "$_old_sha" || {
+      echo "\nError when re-encrypting mailbox!\n"
+      continue
+    }
+    _new_blf="$($P "$_new_pass" | smtpctl encrypt)"
+    query "UPDATE credentials SET password='$_new_blf' WHERE id=$_uid;"
+    echo "Password for user $_addr was updated. Mail box was re-encrypted."
+    break
+  done
+}
+
+delete_user() {
+  echo "\nWhich user to remove:"
+  select_user _addr _uid
+  [ "$_uid" == "0" ] && return
+  yN "Delete $_addr?" || return
+  echo -n "Type $_addr to confirm: "
+  read _confirm_addr
+  [ "$_addr" != "$_confirm_addr" ] && { printf "\nMismatch!\n "; return; }
+  echo "\nRemoving mailbox.."
+  _uhd="$($DADM user -f home $_addr)"
+  [ -n "$_uhd" ] && rm -rfv $_uhd || {
+    echo "\nError when removing mailbox $_addr"
+    return 1
+  }
+  echo "\nRemoving from credentials and virtuals.."
+  query "DELETE FROM credentials WHERE id=$_uid;"
+#  $P "\nRemoving from virtuals.."
+#  query "DELETE FROM virtuals WHERE email='$_addr';"
+#  query "DELETE FROM virtuals WHERE destination='$_addr';"
+  echo "\nUser $_addr and his mailbox was deleted"
+}
+
+add_alias() {
+  [ -n "$1" -a -n "$2" -a -n "$3" ] && {
+    new_alias="$1"
+    dest_addr="$2"
+    uid="$3"
+    true
+  } || {
+    echo "\nSelect alias domain:"
+    select_domain _domain _did
+    [ "$_did" == "0" ] && return
+    while true
+    do
+      echo -n "\nEnter new alias name at ${_domain}, without domain (or press enter for return to main menu): "
+      read _name
+      [ -z "$_name" ] && return
+      echo -n "$_name" | grep -q '^[a-zA-Z0-9\-\.]\{1,\}$' || continue
+      new_alias="${_name}@${_domain}"
+      _existence="$(query "SELECT email||' -> '||destination AS alias FROM virtuals WHERE email='$new_alias';")"
+      [ -n "$_existence" ] && {
+        echo "\nAlias(es):\n${_existence}\nalready exist(s) in database."
+        yN "Continue?" || continue
+      }
+      break
+    done
+    echo "\nSelect destination address:"
+    yN "Want to enter a custom address?" && {
+      while true
+      do
+        echo "Enter full email address (external domains allowed)"
+        echo "or list separated by ', ' (only own domains are allowed)"
+        echo "or press enter key to main menu:"
+        read dest_addr
+        [ -z "$dest_addr" ] && return
+        echo -n "$dest_addr" | grep -q -E '^[a-zA-Z0-9\-_\.]{1,}@(([[:alpha:]](-{0,2}[[:alnum:]])*)\.)+([[:alpha:]]{2,}|[xX]{1}[nN]{1}--[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])(, [a-zA-Z0-9\-_\.]{1,}@(([[:alpha:]](-{0,2}[[:alnum:]])*)\.)+([[:alpha:]]{2,}|[xX]{1}[nN]{1}--[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9]))*$' || {
+          echo "invalid email address or email list format"
+          continue
+        }
+        uid=$(query "SELECT user_id FROM virtuals WHERE email='postmaster@$_domain';")
+        break
+      done
+      true
+    } || {
+      select_user dest_addr uid
+    }
+  }
+  [ "$uid" == "0" ] && return
+  query "INSERT INTO virtuals(user_id, email, destination) VALUES($uid, '$new_alias', '$dest_addr');" || {
+    echo "\nERROR!\n"
+    continue
+  }
+  echo "\nNew alias $new_alias -> $dest_addr created!\n"
+}
+
+delete_alias() {
+  _table="$(query ".mode column" "SELECT id, email, destination FROM virtuals;")"
+  _ids="$(query "SELECT MAX(id) FROM virtuals;")"
+  while true
+  do
+    printf "\nSelect alias for remove:\n%s\nEnter alias id [0-%d] (0 to main menu): " "$_table" $_ids
+    read aid
+    if_not_num "$aid" 0 $_ids && continue
+    [ $aid -eq 0 ] && return
+    to_del="$(query "SELECT * FROM virtuals WHERE id=$aid;")"
+    echo "\nThis alias will be removed:\n$to_del"
+    yN "Continue?" || continue
+    query "DELETE FROM virtuals WHERE id=$aid;" || { printf "\nERROR\n"; continue; }
+    echo "Alias was removed"
+    break
+  done
+}
+
+dns_help() {
+  [ ! -z "$1" ] && {
+    _domain="$1"
+  } || select_domain _domain _domain_id
+  
+  echo "\nCurrent DNS records for ${_domain}:"
+  dig +noall +answer mx $_domain
+  dig +noall +answer txt dkim._domainkey.$_domain
+  dig +noall +answer txt $_domain
+  dig +noall +answer txt _dmarc.$_domain
+#  dig +noall +answer srv _autodiscover._tcp.$_domain
+#  dig +noall +answer srv _imaps._tcp.$_domain
+#  dig +noall +answer srv _submission._tcp.$_domain
+#  dig +noall +answer cname $_domain
+#  dig +noall +answer autoconfig.$_domain
+#  dig +noall +answer autodiscover.$_domain
+  echo "\nNecessary DNS records for ${_domain}:"
+  echo "${_domain}.       86400   IN      MX      5 $(</etc/mail/mailname)."
+  echo "dkim._domainkey.${_domain}. 77488 IN TXT \"v=DKIM1; k=rsa; p=$((sed -e '1,1d' -e '$ d' | tr -d '\n')</var/rspamd/dkim/${_domain}.pub);\""
+  echo "${_domain}.       86400   IN      TXT     \"v=spf1 mx ip4:THIS_SERVER_IP_ADDRESS ~all\""
+  echo "_dmarc.${_domain}. 86400  IN      TXT     \"v=DMARC1; p=none; pct=100; rua=mailto:postmaster@${_domain};\""
+#  echo "\nRecommended DNS records for ${_domain}:"
+#  echo "_autodiscover._tcp.${_domain}. 86400 IN SRV 0 1 443 autodiscover.${_domain}."
+#  echo "_autodiscover._tcp.${_domain}. 86400 IN SRV 1 10 443 autodiscover.${_domain}."
+#  echo "_imaps._tcp.${_domain}. 1528 IN   SRV     0 1 993 $SERVERNAME."
+#  echo "_submission._tcp.${_domain}. 1528 IN SRV  0 1 587 $SERVERNAME."
+#  echo "${_domain}.       86400   IN      TXT     \"mailconf=autoconfig.${_domain}/mail/config-v1.1.xml\""
+#  echo "autoconfig.${_domain}. 86400 IN   A       $SERVER_IP"
+#  echo "autodiscover.${_domain}. 1528 IN  A       $SERVER_IP"
+  
+}
+
+add_domain() {
+  while true
+  do
+    echo "Domains:"
+    query ".mode column" "SELECT id, domain FROM domains;"
+    echo -n "Type new domain name (or press enter to main menu): "
+    read _new_domain
+    [ -z "$_new_domain" ] && return
+    echo -n "$_new_domain" | grep -q -E '^(([[:alpha:]](-{0,2}[[:alnum:]])*)\.)+([[:alpha:]]{2,}|[xX]{1}[nN]{1}--[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])$' || continue
+    query "INSERT INTO domains(domain) VALUES('$_new_domain');" || continue
+    did="$(query 'SELECT MAX(id) FROM domains;')"
+    while true
+    do
+      echo "Now need add admin user for domain ${_new_domain}: "
+      new_user $_new_domain $did && break
+    done
+    uid="$(query "SELECT MAX(id) FROM credentials WHERE domain_id=$did;")"
+    addr="$(query "SELECT email FROM credentials WHERE id=$uid;")"
+    add_alias "abuse@$_new_domain"      "$addr" $uid
+    add_alias "hostmaster@$_new_domain" "$addr" $uid
+    add_alias "postmaster@$_new_domain" "$addr" $uid
+    add_alias "webmaster@$_new_domain"  "$addr" $uid
+    break
+  done
+  mkdir -p /var/rspamd/dkim
+  _key_file="/var/rspamd/dkim/${_new_domain}.dkim.key"
+  _pub_key_file="/var/rspamd/dkim/${_new_domain}.pub"
+  echo "Generating RSA keys for dkim..."
+  openssl genrsa -out $_key_file 2048
+  openssl rsa -in $_key_file -pubout -out $_pub_key_file
+#  rspamadm dkim_keygen -s 'default' -b 2048 -d $_new_domain -k $_key_file > $_dns_file 
+  chmod 0440 $_key_file
+  chown root:_rspamd $_key_file
+#  regen_rspamd_dkim_conf
+  echo "Mail domain $_new_domain successful created!"
+  dns_help "$_new_domain"
+  [ "$1" != "" ] && eval "$1=\$_new_domain"
+  true
+}
+
+system_setup() {
+
+  echo 'Welcome to mail server administration script!
+The following packages will be additionally installed:
+ opensmtpd-extras, opensmtpd-filter-rspamd, opensmtpd-filter-senderscore,
+ dovecot, dovecot-pigeonhole, rspamd, redis, sqlite3
+
+Press enter to start installation and setup or ctrl-c to exit'
+  read
+
+  while true
+  do
+    echo -n "Enter mail server hostname (like mail.mydomain.com): "
+    read HOSTNAME
+    echo -n "$HOSTNAME" | grep -q -E '^(([[:alpha:]](-{0,2}[[:alnum:]])*)\.)+([[:alpha:]]{2,}|[xX]{1}[nN]{1}--[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])$' || continue
+    break
+  done
+
+  mkdir /var/vmail
+  useradd -c "Virtual Mail Account" -d /var/vmail -s /sbin/nologin -u 2000 -g =uid -L staff vmail
+  chown vmail:vmail /var/vmail
+
+  echo "\nInstalling required packages.."
+  pkg_add opensmtpd-extras opensmtpd-filter-rspamd opensmtpd-filter-senderscore \
+      dovecot dovecot-pigeonhole rspamd redis sqlite3
+
+  SQ3="${PS_PROTECT}$(whereis sqlite3)"
+  DADM="${PS_PROTECT}$(whereis doveadm)"
+
+  echo "\nGeneratng ssl keys.."
+
+  openssl genrsa -out /etc/ssl/private/$HOSTNAME.key 4096
+  openssl req -new -x509 -nodes -days 3650 \
+          -key /etc/ssl/private/$HOSTNAME.key -sha256 > /etc/ssl/$HOSTNAME.fullchain.pem
+  chmod 0400 /etc/ssl/private/$HOSTNAME.key
+
+
+  echo "\nSetup smtpd.."
+  echo "$HOSTNAME" > /etc/mail/mailname
+
+  echo "
+dbpath $UDB
+query_alias SELECT destination FROM virtuals WHERE email=?;
+query_credentials SELECT email, password FROM credentials WHERE email=?;
+query_domain SELECT domain FROM domains WHERE domain=?;
+" > /etc/mail/sqlite.conf
+
+  mv -v /etc/mail/smtpd.conf /etc/mail/smtpd.conf.default
+
+  cat << __EOF > /etc/mail/smtpd.conf
+pki "$HOSTNAME" cert "/etc/ssl/$HOSTNAME.fullchain.pem"
+pki "$HOSTNAME" key "/etc/ssl/private/$HOSTNAME.key"
+
+table aliases file:/etc/mail/aliases
+table fullboxes file:/etc/mail/fullboxes
+table domains sqlite:/etc/mail/sqlite.conf
+table virtuals sqlite:/etc/mail/sqlite.conf
+table credentials sqlite:/etc/mail/sqlite.conf
+
+filter check_dyndns phase connect match rdns regex { '.*\.dyn\..*', '.*\.dsl\..*' } \\
+    disconnect "550 no residential connections"
+
+filter check_rdns phase connect match !rdns \\
+    disconnect "550 no rDNS is so 80s"
+
+filter check_fcrdns phase connect match !fcrdns \\
+    disconnect "550 no FCrDNS is so 80s"
+
+filter senderscore \\
+    proc-exec "filter-senderscore -blockBelow 10 -junkBelow 70 -slowFactor 5000"
+
+filter check_quota phase rcpt-to match rcpt-to <fullboxes> \\
+    disconnect "552 Quota exceeded (mailbox for user is full)"
+
+filter "rspamd" proc-exec "/usr/local/libexec/smtpd/filter-rspamd"
+
+queue compression
+
+# Encrypt queue files with EVP_aes_256_gcm(3).
+# (generate a key with 'openssl rand -hex 16')
+queue encryption $(openssl rand -hex 16)
+
+smtp max-message-size 35M
+
+listen on all tls pki "$HOSTNAME" hostname "$HOSTNAME" \\
+        filter { check_dyndns, check_rdns, check_fcrdns, senderscore, rspamd, check_quota }
+listen on egress port submission tls-require pki "$HOSTNAME" hostname "$HOSTNAME" auth <credentials> \\
+        filter "rspamd" mask-src
+
+action "local_mail" mbox alias <aliases>
+action "lmtp" lmtp "/var/dovecot/lmtp" rcpt-to virtual <virtuals>
+action "outbound" relay
+
+match from any for domain <domains> action "lmtp"
+match from local for local action "local_mail"
+
+match from local for any action "outbound"
+match auth from any for any action "outbound"
+__EOF
+
+  echo "\nSetup mail user quota checking.."
+  touch /etc/mail/fullboxes
+  chown vmail /etc/mail/fullboxes
+  echo '#!/bin/sh
+fullboxes=/etc/mail/fullboxes
+old_list="$(<$fullboxes)"
+new_list="$(doveadm -f flow quota get -A | \
+        sed -n "s/\(.*\) Quota name=User quota Type=STORAGE Value=\([0-9]*\) Limit=\([0-9]*\) %=[0-9]*/\1 \2 \3/p" | \
+        while read email cur max;do [ $cur -ge $max ] && echo "${email}:${email}"; done)"
+
+[ "$old_list" != "$new_list" ] && { printf "$new_list" > $fullboxes; smtpctl update table fullboxes; }
+' > /etc/mail/check_quota.sh
+  chmod +x /etc/mail/check_quota.sh
+
+  echo "Quota checks will be every 5 minutes from cron"
+  CRON_LINE='*/5     *       *       *       *       /etc/mail/check_quota.sh >> /root/check_quota.log 2>&1'
+  (crontab -u root -l; echo "$CRON_LINE" ) | crontab -u root -
+
+  echo "\nSetup dovecot.."
+  echo "Tuning /etc/login.conf:"
+  echo '
+dovecot:\
+
+    :openfiles-cur=1024:\
+
+    :openfiles-max=2048:\
+
+    :tc=daemon: 
+' | tee -a /etc/login.conf
+  mkdir -p /etc/ssl/dovecot
+  openssl dhparam 2048 | tee /etc/ssl/dovecot/dh.pem
+  cat << __EOF > /etc/dovecot/dovecot-sql.conf.ext
+driver = sqlite
+connect = $UDB
+default_pass_scheme = BLF-CRYPT
+
+password_query = \\
+  SELECT email AS user, password \\
+  FROM credentials \\
+  WHERE email = '%u';
+
+user_query = \\
+  SELECT '*:bytes='||quota AS quota_rule \\
+  FROM credentials \\
+  WHERE email = '%u';
+
+iterate_query = SELECT email AS user FROM credentials;
+__EOF
+
+  cat << __EOF > /etc/dovecot/quota-warning.sh
+#!/bin/sh
+PERCENT=\$1
+USER=\$2
+cat << EOF | /usr/local/libexec/dovecot/dovecot-lda -d \$USER -o "plugin/quota=count:User quota:noenforcing"
+From: postmaster@DOMAINNAME
+Subject: QUOTA WARNING!
+
+Your mailbox is now \$PERCENT% full.
+EOF
+__EOF
+  chmod +x /etc/dovecot/quota-warning.sh
+
+  mv -v /etc/dovecot/dovecot.conf /etc/dovecot/dovecot.conf.default
+
+  cat << __EOF > /etc/dovecot/dovecot.conf
+ssl = required
+ssl_cert = </etc/ssl/$HOSTNAME.fullchain.pem
+ssl_key = </etc/ssl/private/$HOSTNAME.key
+ssl_dh = </etc/ssl/dovecot/dh.pem
+
+ssl_prefer_server_ciphers = yes
+
+auth_mechanisms = plain
+first_valid_uid = 2000
+first_valid_gid = 2000
+
+mail_uid = vmail
+mail_gid = vmail
+
+mail_location = maildir:/var/vmail/%d/%n
+mail_plugin_dir = /usr/local/lib/dovecot
+
+mail_attribute_dict = file:%h/Maildir/dovecot-attributes
+
+managesieve_notify_capability = mailto
+managesieve_sieve_capability = fileinto reject envelope encoded-character vacation subaddress comparator-i;ascii-numeric relational regex imap4flags copy include variables body enotify environment mailbox date index ihave duplicate mime foreverypart extracttext imapsieve vnd.dovecot.imapsieve
+mbox_write_locks = fcntl
+mmap_disable = yes
+
+
+namespace inbox {
+  inbox = yes
+  location =
+  mailbox Archive {
+    auto = subscribe
+    special_use = \\Archive
+  }
+  mailbox Drafts {
+    auto = subscribe
+    special_use = \\Drafts
+  }
+  mailbox Junk {
+    auto = subscribe
+    special_use = \\Junk
+  }
+  mailbox Sent {
+    auto = subscribe
+    special_use = \\Sent
+  }
+  mailbox Trash {
+    auto = subscribe
+    special_use = \\Trash
+  }
+  prefix =
+  separator = /
+}
+
+plugin {
+  imapsieve_mailbox1_before = file:/usr/local/lib/dovecot/sieve/report-spam.sieve
+  imapsieve_mailbox1_causes = COPY
+  imapsieve_mailbox1_name = Junk
+  imapsieve_mailbox2_before = file:/usr/local/lib/dovecot/sieve/report-ham.sieve
+  imapsieve_mailbox2_causes = COPY
+  imapsieve_mailbox2_from = Junk
+  imapsieve_mailbox2_name = *
+  sieve = file:~/sieve;active=~/.dovecot.sieve
+  sieve_global_extensions = +vnd.dovecot.pipe +vnd.dovecot.environment
+  sieve_pipe_bin_dir = /usr/local/lib/dovecot/sieve
+  sieve_plugins = sieve_imapsieve sieve_extprograms
+}
+
+passdb {
+  driver = sql
+  args = /etc/dovecot/dovecot-sql.conf.ext
+  override_fields = userdb_mail_crypt_private_password=%{sha512:password} userdb_mail_crypt_save_version=2
+}
+
+userdb {
+  driver = sql
+  args = /etc/dovecot/dovecot-sql.conf.ext
+  override_fields = uid=vmail gid=vmail home=/var/vmail/%d/%n
+}
+
+mail_plugins = \$mail_plugins quota
+
+protocol !indexer-worker {
+  mail_vsize_bg_after_count = 100
+}
+
+plugin {
+  quota = count:User quota
+  quota_vsizes = yes
+  quota_grace = 100M
+  quota_max_mail_size = 100M
+  quota_status_success = DUNNO
+  quota_status_nouser = DUNNO
+  quota_status_overquota = "552 5.2.2 Mailbox is full"
+  quota_warning = storage=95%% quota-warning 95 %u
+  quota_warning2 = storage=80%% quota-warning 80 %u
+  quota_warning3 = -storage=100%% quota-warning below %u
+}
+
+service quota-warning {
+  executable = script /etc/dovecot/quota-warning.sh
+  user = vmail
+  unix_listener quota-warning {
+    user = vmail
+  }
+}
+
+
+service stats {
+    unix_listener stats-reader {
+        user = vmail
+        mode = 0660
+    }
+    unix_listener stats-writer {
+        user = vmail
+        mode = 0660
+    }
+}
+
+
+protocols = imap sieve lmtp
+
+service imap-login {
+  inet_listener imap {
+    port = 0
+  }
+}
+
+service managesieve-login {
+  inet_listener sieve {
+    port = 4190
+  }
+  inet_listener sieve_deprecated {
+    port = 2000
+  }
+}
+
+mail_plugins = \$mail_plugins mail_crypt
+plugin {
+  mail_crypt_curve = secp521r1
+  mail_crypt_save_version = 2
+  mail_crypt_require_encrypted_user_key = yes
+}
+
+protocol imap {
+  mail_plugins = \$mail_plugins imap_quota imap_sieve
+}
+
+service lmtp {
+  user = vmail
+  unix_listener lmtp {
+    #mode = 0666
+  }
+}
+__EOF
+
+
+  echo "Setup report spam/ham.."
+  echo '
+require ["vnd.dovecot.pipe", "copy", "imapsieve", "environment", "variables"];
+
+if environment :matches "imap.mailbox" "*" {
+
+  set "mailbox" "${1}";
+
+}
+
+if string "${mailbox}" "Trash" {
+
+  stop;
+
+}
+
+if environment :matches "imap.user" "*" {
+
+  set "username" "${1}";
+
+}
+
+pipe :copy "sa-learn-ham.sh" [ "${username}" ];
+' > /usr/local/lib/dovecot/sieve/report-ham.sieve
+
+  echo '
+require ["vnd.dovecot.pipe", "copy", "imapsieve", "environment", "variables"];
+
+if environment :matches "imap.user" "*" {
+
+  set "username" "${1}";
+
+}
+
+pipe :copy "sa-learn-spam.sh" [ "${username}" ];
+' > /usr/local/lib/dovecot/sieve/report-spam.sieve
+  (cd /usr/local/lib/dovecot/sieve; sievec report-ham.sieve;sievec report-spam.sieve)
+  echo '#!/bin/sh
+
+exec /usr/local/bin/rspamc -d "${1}" learn_ham
+' > /usr/local/lib/dovecot/sieve/sa-learn-ham.sh
+  echo '#!/bin/sh
+
+exec /usr/local/bin/rspamc -d "${1}" learn_spam
+' > /usr/local/lib/dovecot/sieve/sa-learn-spam.sh
+
+  chmod 0755 /usr/local/lib/dovecot/sieve/sa-learn-ham.sh
+  chmod 0755 /usr/local/lib/dovecot/sieve/sa-learn-spam.sh
+
+  rcctl enable dovecot
+  rcctl start dovecot
+
+  rcctl enable redis rspamd
+  rcctl start redis rspamd
+
+  init_db
+  add_domain _main_domain
+  sed -i "s/postmaster@DOMAINNAME/postmaster@$_main_domain/" /etc/dovecot/quota-warning.sh
+  rcctl restart smtpd dovecot redis rspamd
+
+  echo "
+
+Complete!
+
+DO NOT FORGET PLEASE:
+
+
+1) Open ports in /etc/pf.conf like:
+>pass in quick on vio0 proto tcp from any to port { ssh, smtp, submission, smtps, imap, imaps }<
+
+
+2) Ask your hoster/provider to set reverse DNS to $HOSTNAME
+
+
+3) Configure DNS records!
+
+Enjoy!
+
+ *
+  ,
+ o :
+<#\\. 
+ |\\
+"
+}
+
+migrate_from_gmail() {
+  type  imapsync >/dev/null 2>&1 || { echo "imapsync required (run 'pkg_add imapsync' please)"; return 0; }
+  _IMPS="${PS_PROTECT}$(whereis imapsync)"
+  echo "Migration helper (from google mail)"
+  echo "
+  1) Open Google account -> Security
+  (https://myaccount.google.com/security)
+
+  2) Signing in to Google -> App passwords
+
+  3) Add new app pasword
+
+  4) Don't forget: after all mail is transferred to the new mailbox, remove the password from App passwords
+
+"  
+  printf "Google mail address: "
+  read _gmail_addr
+
+  read_pass "Gmail app password (see above):" _gmail_pass
+
+  printf "New address (local): "
+  select_user _local_addr _uid
+  while true
+  do
+    read_pass "Enter password for local user $_addr:" _local_pass
+    _old_blf="$(query "SELECT password from credentials WHERE id=$_uid;")"
+    $DADM pw -t "{crypt}$_old_blf" -p "$_local_pass" >/dev/null 2>&1 && {
+      echo "The password is correct!"
+      break
+    } || {
+      echo "The password is incorrect!"
+      continue
+    }
+  done
+
+  $_IMPS --nolog --no-modulesversion --debugssl 0 \
+           --gmail1 --ssl1 --host1 imap.gmail.com --port1 993 --user1 ${_gmail_addr} --password1 "$_gmail_pass" \
+           --ssl2 --host2 127.0.0.1 --port2 993 --user2 ${_local_addr} --password2 "$_local_pass"
+  echo "\nMigration from GMail complete!\n"
+
+}
+
+menu='
+Mail admin menu:
+1. Add new user
+2. Change password
+3. Change quota
+4. Delete user
+5. Add domain
+6. Delete domain
+7. Add alias
+8. Delete alias
+9. Help
+0. Exit
+Press 0-9 key'
+
+help_mnu='
+Help menu:
+1. DNS
+2. Migrate from GMail
+3. More help
+0. Main menu
+'
+
+help_menu() {
+  echo "$help_mnu"
+  while IFS= read_char action
+  do
+    if_not_num "$action" 0 3 && continue
+    case $action in
+      0) return 0           ;;
+      1) dns_help           ;;
+      2) migrate_from_gmail ;;
+      3) echo 'https://docs.google.com/spreadsheets/d/1acLUWan3KfgRC4f8cv53Tr3hnavbfVNRbJUQlrmKrio' ;;
+      *) ;;
+    esac
+    echo "$help_mnu"
+  done
+}
+
+[ -e $UDB ] || system_setup
+
+echo "$menu"
+while IFS= read_char action
+do
+  if_not_num "$action" 0 9 && continue
+  case $action in
+    0) exit 0          ;;
+    1) new_user        ;;
+    2) change_password ;;
+    3) change_quota    ;;
+    4) delete_user     ;;
+    5) add_domain      ;;
+    6) delete_domain   ;;
+    7) add_alias       ;;
+    8) delete_alias    ;;
+    9) help_menu       ;;
+    *) ;;
+  esac
+  echo "$menu"
+done
