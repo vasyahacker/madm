@@ -1,6 +1,8 @@
 # madm 
 Mail auto configuration and interactive administration for OpenBSD
 
+[How to script works (ru)](https://github.com/vasyahacker/madm/raw/main/explain_ru.txt)
+
 ### Features
 - Multi domains
 - Mailbox quota
