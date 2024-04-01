@@ -1,6 +1,8 @@
 # madm 
 Mail auto configuration and interactive administration for OpenBSD
+
 [Introduction (ru)](https://telegra.ph/Pereezd-pochty-05-24)
+
 [How to script works (ru)](https://github.com/vasyahacker/madm/raw/main/explanation_ru.txt)
 
 ### Features
