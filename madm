@@ -452,8 +452,10 @@ Press enter to start installation and setup or ctrl-c to exit'
   chown vmail:vmail /var/vmail
 
   echo "Installing required packages.."
-  pkg_add opensmtpd-extras opensmtpd-filter-rspamd opensmtpd-filter-senderscore \
+  pkg_add opensmtpd-filter-rspamd opensmtpd-filter-senderscore \
       dovecot dovecot-pigeonhole rspamd redis sqlite3
+  
+  pkg_add  opensmtpd-extra || pkg_add opensmtpd-table-sqlite
 
   SQ3="${PS_PROTECT}$(whereis sqlite3)"
   DADM="${PS_PROTECT}$(whereis doveadm)"
