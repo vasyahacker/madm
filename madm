@@ -455,7 +455,7 @@ Press enter to start installation and setup or ctrl-c to exit'
   pkg_add opensmtpd-filter-rspamd opensmtpd-filter-senderscore \
       dovecot dovecot-pigeonhole rspamd redis sqlite3
   
-  pkg_add  opensmtpd-extra || pkg_add opensmtpd-table-sqlite
+  pkg_add  opensmtpd-extras || pkg_add opensmtpd-table-sqlite
 
   SQ3="${PS_PROTECT}$(whereis sqlite3)"
   DADM="${PS_PROTECT}$(whereis doveadm)"
